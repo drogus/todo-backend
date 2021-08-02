@@ -4,7 +4,7 @@ extern crate log;
 use actix_cors::Cors;
 use actix_web::{
     delete, get, post, patch, web, App,
-    HttpResponse, HttpServer, Responder,
+    HttpResponse, HttpServer, Responder, error, http::header, http::StatusCode, HttpResponseBuilder
 };
 use anyhow::Result;
 use listenfd::ListenFd;
@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgPoolOptions};
 use sqlx::{PgPool};
 use std::env;
+use derive_more::{Display, Error as DeriveError};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Todo {
@@ -41,19 +42,44 @@ struct TodoPresenter {
     url: String,
 }
 
-#[get("/todos")]
-async fn todos_list_handler(pool: web::Data<PgPool>, routing: web::Data<RoutingService>) -> HttpResponse {
-    let result = sqlx::query_as!(Todo, r#"SELECT * FROM todos ORDER BY id"#)
-        .fetch_all(pool.get_ref())
-        .await;
+#[derive(Debug, Display, DeriveError)]
+enum Error {
+    #[display(fmt = "internal error")]
+    InternalError,
 
-    match result {
-        Ok(todos) => HttpResponse::Ok().json(todos.into_iter().map(|todo| {
-            let url = routing.todo_url(todo.id);
-            TodoPresenter { todo, url }
-        }).collect::<Vec<TodoPresenter>>()),
-        _ => HttpResponse::BadRequest().body("Error trying to create new todo"),
+    #[display(fmt = "bad request")]
+    BadClientData,
+
+    #[display(fmt = "timeout")]
+    Timeout,
+}
+
+impl error::ResponseError for Error {
+    fn error_response(&self) -> HttpResponse {
+        HttpResponseBuilder::new(self.status_code())
+            .set_header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(self.to_string())
     }
+
+    fn status_code(&self) -> StatusCode {
+        match *self {
+            Error::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
+            Error::BadClientData => StatusCode::BAD_REQUEST,
+            Error::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        }
+    }
+}
+
+#[get("/todos")]
+async fn todos_list_handler(pool: web::Data<PgPool>, routing: web::Data<RoutingService>) -> Result<Vec<TodoPresenter>, Error> {
+    let todos = sqlx::query_as!(Todo, r#"SELECT * FROM todos ORDER BY id"#)
+        .fetch_all(pool.get_ref())
+        .await?;
+
+    Ok(todos.into_iter().map(|todo| {
+        let url = routing.todo_url(todo.id);
+        TodoPresenter { todo, url }
+    }).collect::<Vec<TodoPresenter>>())
 }
 
 #[get("/todos/{id:\\d+}")]
