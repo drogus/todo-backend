@@ -1,0 +1,19 @@
+---
+version: '3.7'
+
+services:
+  db:
+    container_name: postgres-todo-backend
+    image: postgres:13.3
+    environment:
+      POSTGRES_USER: postgres
+      PSQL_TRUST_LOCALNET: 'true'
+      ENCODING: 'UTF8'
+      POSTGRES_PASSWORD: 'postgres'
+    volumes:
+      - postgres-storage:$HOME/.containers/db/todo-backend-postgres
+    ports:
+      - 5432:5432
+volumes:
+  postgres-storage:
+
