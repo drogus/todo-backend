@@ -3,23 +3,23 @@ extern crate log;
 
 use actix_cors::Cors;
 use actix_web::{
-    delete, get, post, patch, web, App,
-    HttpResponse, HttpServer, Responder, error, http::header, http::StatusCode, HttpResponseBuilder
+    delete, error, get, http::header, http::StatusCode, patch, post, web, App, HttpResponse,
+    HttpResponseBuilder, HttpServer, Responder, HttpRequest
 };
 use anyhow::Result;
+use derive_more::{Display, Error as DeriveError};
 use listenfd::ListenFd;
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::{PgPoolOptions};
-use sqlx::{PgPool};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::PgPool;
 use std::env;
-use derive_more::{Display, Error as DeriveError};
 
 #[derive(Serialize, Deserialize, Debug)]
 struct Todo {
     id: i64,
     title: String,
     completed: bool,
-    order: i64
+    order: i64,
 }
 
 #[derive(Deserialize)]
@@ -42,6 +42,11 @@ struct TodoPresenter {
     url: String,
 }
 
+struct TodosList {
+    todos: Vec<Todo>,
+    routing: RoutingService,
+}
+
 #[derive(Debug, Display, DeriveError)]
 enum Error {
     #[display(fmt = "internal error")]
@@ -52,6 +57,9 @@ enum Error {
 
     #[display(fmt = "timeout")]
     Timeout,
+
+    #[display(fmt = "not found")]
+    NotFound,
 }
 
 impl error::ResponseError for Error {
@@ -66,87 +74,111 @@ impl error::ResponseError for Error {
             Error::InternalError => StatusCode::INTERNAL_SERVER_ERROR,
             Error::BadClientData => StatusCode::BAD_REQUEST,
             Error::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            Error::NotFound => StatusCode::NOT_FOUND,
         }
     }
 }
 
+impl From<sqlx::Error> for Error {
+    fn from(error: sqlx::Error) -> Self {
+        match error {
+            sqlx::Error::RowNotFound => Error::NotFound,
+            _ => Error::InternalError
+        }
+    }
+}
+
+impl Responder for TodosList {
+    fn respond_to(self, _: &HttpRequest) -> HttpResponse {
+        let routing = self.routing.clone();
+        let result = self.todos.into_iter()
+        .map(|todo| {
+            let url = routing.todo_url(todo.id);
+            TodoPresenter { todo, url }
+        })
+        .collect::<Vec<TodoPresenter>>();
+        HttpResponse::Ok().json(result)
+    }
+}
+
+impl Responder for TodoPresenter {
+    fn respond_to(self, _: &HttpRequest) -> HttpResponse {
+        HttpResponse::Ok().json(self)
+    }
+}
+
 #[get("/todos")]
-async fn todos_list_handler(pool: web::Data<PgPool>, routing: web::Data<RoutingService>) -> Result<Vec<TodoPresenter>, Error> {
+async fn todos_list_handler(
+    pool: web::Data<PgPool>,
+    routing: web::Data<RoutingService>,
+) -> Result<TodosList, Error> {
     let todos = sqlx::query_as!(Todo, r#"SELECT * FROM todos ORDER BY id"#)
         .fetch_all(pool.get_ref())
         .await?;
 
-    Ok(todos.into_iter().map(|todo| {
-        let url = routing.todo_url(todo.id);
-        TodoPresenter { todo, url }
-    }).collect::<Vec<TodoPresenter>>())
+    let routing = routing.get_ref().clone();
+    Ok(TodosList { routing, todos })
 }
 
 #[get("/todos/{id:\\d+}")]
-async fn todos_show_handler(path: web::Path<i64>, pool: web::Data<PgPool>, routing: web::Data<RoutingService>) -> HttpResponse {
+async fn todos_show_handler(
+    path: web::Path<i64>,
+    pool: web::Data<PgPool>,
+    routing: web::Data<RoutingService>,
+) -> Result<TodoPresenter, Error> {
     let id = path.into_inner();
-    let result = sqlx::query_as!(Todo, r#"SELECT * FROM todos WHERE id = $1"#, id)
+    let todo = sqlx::query_as!(Todo, r#"SELECT * FROM todos WHERE id = $1"#, id)
         .fetch_one(pool.get_ref())
-        .await;
+        .await?;
 
-    match result {
-        Ok(todo) => {
-            let url = routing.todo_url(id);
-            HttpResponse::Ok().json(TodoPresenter { todo, url })
-        },
-        _ => HttpResponse::BadRequest().body("Error trying to create new todo"),
-    }
+    let url = routing.todo_url(id);
+    Ok(TodoPresenter { todo, url })
 }
 
 #[post("/todos")]
-async fn create_todo_handler(pool: web::Data<PgPool>, new_todo: web::Json<NewTodo>, routing: web::Data<RoutingService>) -> impl Responder {
+async fn create_todo_handler(
+    pool: web::Data<PgPool>,
+    new_todo: web::Json<NewTodo>,
+    routing: web::Data<RoutingService>,
+) -> Result<TodoPresenter, Error> {
     let todo = new_todo.into_inner();
     let title = todo.title;
     let order = todo.order.unwrap_or(0);
-    let result = sqlx::query_as!(Todo, r#"INSERT INTO todos (title, "order") VALUES($1, $2) RETURNING id, title, completed, "order""#, title, order)
+    let todo = sqlx::query_as!(Todo, r#"INSERT INTO todos (title, "order") VALUES($1, $2) RETURNING id, title, completed, "order""#, title, order)
         .fetch_one(pool.get_ref())
-        .await;
+        .await?;
 
-    match result {
-        Ok(todo) => {
-            let url = routing.todo_url(todo.id);
-            HttpResponse::Ok().json(TodoPresenter { todo, url })
-        },
-        _ => HttpResponse::BadRequest().body("Error trying to create new todo"),
-    }
+    let url = routing.todo_url(todo.id);
+    Ok(TodoPresenter { todo, url })
 }
 
 #[patch("/todos/{id:\\d+}")]
-async fn patch_todo_handler(path: web::Path<i64>, pool: web::Data<PgPool>, update_todo: web::Json<UpdateTodo>, routing: web::Data<RoutingService>) -> impl Responder {
+async fn patch_todo_handler(
+    path: web::Path<i64>,
+    pool: web::Data<PgPool>,
+    update_todo: web::Json<UpdateTodo>,
+    routing: web::Data<RoutingService>,
+) -> Result<TodoPresenter, Error> {
     let id = path.into_inner();
-    let result = sqlx::query_as!(Todo, r#"SELECT * FROM todos WHERE id = $1"#, id)
+    let mut todo = sqlx::query_as!(Todo, r#"SELECT * FROM todos WHERE id = $1"#, id)
         .fetch_one(pool.get_ref())
-        .await;
+        .await?;
 
-    match result {
-        Ok(mut todo) => {
-            if let Some(title) = &update_todo.title {
-                todo.title = title.clone();
-            }
-            if let Some(completed) = update_todo.completed {
-                todo.completed = completed;
-            }
-            if let Some(order) = update_todo.order {
-                todo.order = order;
-            }
-            let result = sqlx::query_as!(Todo, r#"UPDATE todos SET title = $1, completed = $2, "order" = $3 WHERE id = $4 RETURNING id, title, completed, "order""#, todo.title, todo.completed, todo.order, todo.id)
-                .fetch_one(pool.get_ref())
-                .await;
-            match result {
-                Ok(todo) => {
-                    let url = routing.todo_url(todo.id);
-                    HttpResponse::Ok().json(TodoPresenter { todo, url })
-                },
-                _ => HttpResponse::BadRequest().body("Error trying to create new todo"),      
-            }
-        },
-        _ => HttpResponse::BadRequest().body("Error trying to create new todo"),
+    if let Some(title) = &update_todo.title {
+        todo.title = title.clone();
     }
+    if let Some(completed) = update_todo.completed {
+        todo.completed = completed;
+    }
+    if let Some(order) = update_todo.order {
+        todo.order = order;
+    }
+    let todo = sqlx::query_as!(Todo, r#"UPDATE todos SET title = $1, completed = $2, "order" = $3 WHERE id = $4 RETURNING id, title, completed, "order""#, todo.title, todo.completed, todo.order, todo.id)
+        .fetch_one(pool.get_ref())
+        .await?;
+
+    let url = routing.todo_url(todo.id);
+    Ok(TodoPresenter { todo, url })
 }
 
 #[delete("/todos")]
@@ -156,26 +188,23 @@ async fn delete_todos_handler(pool: web::Data<PgPool>) -> impl Responder {
         .await;
 
     match result {
-        Ok(todo) => { HttpResponse::NoContent().finish() },
-        _ => { HttpResponse::BadRequest().body("Error trying to delete a todo") },
+        Ok(todo) => HttpResponse::NoContent().finish(),
+        _ => HttpResponse::BadRequest().body("Error trying to delete a todo"),
     }
 }
 
 #[delete("/todos/{id:\\d+}")]
-async fn delete_todo_handler(path: web::Path<i64>, pool: web::Data<PgPool>, routing: web::Data<RoutingService>) -> impl Responder {
+async fn delete_todo_handler(
+    path: web::Path<i64>,
+    pool: web::Data<PgPool>,
+) -> Result<HttpResponse, Error> {
     let id: i64 = path.into_inner();
     let result = sqlx::query!(r#"DELETE FROM todos WHERE id = $1"#, id)
         .execute(pool.get_ref())
-        .await;
+        .await?;
 
-    match result {
-        Ok(_query_result) => {
-            HttpResponse::NoContent().finish()
-        },
-        Err(e) => {dbg!(e);HttpResponse::BadRequest().body("Error trying to create new todo")},
-    }
+    Ok(HttpResponse::NoContent().finish())
 }
-
 
 #[derive(Debug, Clone)]
 struct RoutingService {
@@ -200,7 +229,10 @@ async fn main() -> Result<()> {
 
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL is not set in .env file");
     let host = env::var("HOST").unwrap_or("127.0.0.1".to_owned());
-    let port: u16 = env::var("PORT").unwrap_or("8080".to_owned()).parse().expect("PORT needs to be in 0-65535 range");
+    let port: u16 = env::var("PORT")
+        .unwrap_or("8080".to_owned())
+        .parse()
+        .expect("PORT needs to be in 0-65535 range");
     let scheme = env::var("SCHEME").unwrap_or("http".to_owned());
 
     let pool = PgPoolOptions::new()
@@ -209,7 +241,11 @@ async fn main() -> Result<()> {
         .await
         .unwrap();
 
-    let routing_service = web::Data::new(RoutingService { host: host.clone(), port, scheme: scheme.clone() });
+    let routing_service = web::Data::new(RoutingService {
+        host: host.clone(),
+        port,
+        scheme: scheme.clone(),
+    });
 
     let mut server = HttpServer::new(move || {
         let cors = Cors::default()
