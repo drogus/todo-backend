@@ -122,27 +122,25 @@ async fn todos_list_handler(
 
 #[get("/todos/{id:\\d+}")]
 async fn todos_show_handler(
-    path: web::Path<i64>,
+    id: web::Path<i64>,
     pool: web::Data<PgPool>,
     routing: web::Data<RoutingService>,
 ) -> Result<TodoPresenter, Error> {
-    let id = path.into_inner();
-    let todo = sqlx::query_as!(Todo, r#"SELECT * FROM todos WHERE id = $1"#, id)
+    let todo = sqlx::query_as!(Todo, r#"SELECT * FROM todos WHERE id = $1"#, *id)
         .fetch_one(pool.get_ref())
         .await?;
 
-    let url = routing.todo_url(id);
+    let url = routing.todo_url(*id);
     Ok(TodoPresenter { todo, url })
 }
 
 #[post("/todos")]
 async fn create_todo_handler(
     pool: web::Data<PgPool>,
-    new_todo: web::Json<NewTodo>,
+    todo: web::Json<NewTodo>,
     routing: web::Data<RoutingService>,
 ) -> Result<TodoPresenter, Error> {
-    let todo = new_todo.into_inner();
-    let title = todo.title;
+    let title = &todo.title;
     let order = todo.order.unwrap_or(0);
     let todo = sqlx::query_as!(Todo, r#"INSERT INTO todos (title, "order") VALUES($1, $2) RETURNING id, title, completed, "order""#, title, order)
         .fetch_one(pool.get_ref())
@@ -154,13 +152,12 @@ async fn create_todo_handler(
 
 #[patch("/todos/{id:\\d+}")]
 async fn patch_todo_handler(
-    path: web::Path<i64>,
+    id: web::Path<i64>,
     pool: web::Data<PgPool>,
     update_todo: web::Json<UpdateTodo>,
     routing: web::Data<RoutingService>,
 ) -> Result<TodoPresenter, Error> {
-    let id = path.into_inner();
-    let mut todo = sqlx::query_as!(Todo, r#"SELECT * FROM todos WHERE id = $1"#, id)
+    let mut todo = sqlx::query_as!(Todo, r#"SELECT * FROM todos WHERE id = $1"#, *id)
         .fetch_one(pool.get_ref())
         .await?;
 
